@@ -1,0 +1,25 @@
+# Core data manipulation
+pandas
+numpy
+
+# Machine learning
+scikit-learn
+
+# Visualization
+matplotlib
+seaborn
+
+# Model persistence
+joblib
+
+# Model explainability
+shap
+
+# String matching (for fuzzy matching of CPU/GPU names)
+fuzzywuzzy
+python-Levenshtein
+
+# TODO: Consider adding later:
+# streamlit  # Frontend (teammate's responsibility)
+# jupyter    # Notebook environment
+# openpyxl   # Excel file support

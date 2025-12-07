@@ -28,6 +28,7 @@ from sklearn.ensemble import (
     GradientBoostingRegressor,
     HistGradientBoostingRegressor
 )
+from sklearn.linear_model import Ridge, ElasticNet
 from sklearn.dummy import DummyRegressor
 from sklearn.model_selection import cross_val_score, cross_validate
 from sklearn.metrics import (
@@ -45,6 +46,22 @@ try:
 except ImportError:
     CATBOOST_AVAILABLE = False
     warnings.warn("CatBoost not installed. CatBoost models will not be available.")
+
+# XGBoost import (optional)
+try:
+    from xgboost import XGBRegressor
+    XGBOOST_AVAILABLE = True
+except (ImportError, OSError, Exception):
+    XGBOOST_AVAILABLE = False
+    XGBRegressor = None
+
+# LightGBM import (optional)
+try:
+    from lightgbm import LGBMRegressor
+    LIGHTGBM_AVAILABLE = True
+except (ImportError, OSError, Exception):
+    LIGHTGBM_AVAILABLE = False
+    LGBMRegressor = None
 
 
 # =============================================================================
@@ -148,6 +165,11 @@ def get_feature_summary(df: pd.DataFrame,
 # SKLEARN PIPELINE CONSTRUCTION
 # =============================================================================
 
+def _convert_to_string(X):
+    """Convert array to string type. Used for categorical preprocessing."""
+    return X.astype(str)
+
+
 def build_preprocessor(numeric_cols: List[str],
                        categorical_cols: List[str]) -> ColumnTransformer:
     """
@@ -175,10 +197,11 @@ def build_preprocessor(numeric_cols: List[str],
 
     # Categorical: convert to string, impute with constant, then one-hot encode
     # The string conversion handles mixed types (bool, str, etc.)
+    # Note: Using named function instead of lambda for pickle compatibility
     categorical_transformer = Pipeline(steps=[
-        ('to_string', FunctionTransformer(lambda X: X.astype(str))),
+        ('to_string', FunctionTransformer(_convert_to_string)),
         ('imputer', SimpleImputer(strategy='constant', fill_value='missing')),
-        ('onehot', OneHotEncoder(handle_unknown='ignore', sparse=False))
+        ('onehot', OneHotEncoder(handle_unknown='ignore', sparse_output=False))
     ])
 
     transformers = []
@@ -207,7 +230,8 @@ def build_sklearn_pipeline(model_type: str,
     Parameters
     ----------
     model_type : str
-        Type of model: 'dummy', 'random_forest', 'gradient_boosting', 'hist_gradient_boosting'
+        Type of model: 'dummy', 'ridge', 'elasticnet', 'random_forest',
+        'gradient_boosting', 'hist_gradient_boosting', 'xgboost', 'lightgbm'
     numeric_cols : List[str]
         List of numeric column names
     categorical_cols : List[str]
@@ -225,6 +249,14 @@ def build_sklearn_pipeline(model_type: str,
     # Select regressor
     if model_type == 'dummy':
         regressor = DummyRegressor(strategy='mean')
+    elif model_type == 'ridge':
+        default_params = {'alpha': 1.0, 'random_state': 42}
+        default_params.update(model_params)
+        regressor = Ridge(**default_params)
+    elif model_type == 'elasticnet':
+        default_params = {'alpha': 1.0, 'l1_ratio': 0.5, 'random_state': 42, 'max_iter': 2000}
+        default_params.update(model_params)
+        regressor = ElasticNet(**default_params)
     elif model_type == 'random_forest':
         default_params = {'n_estimators': 100, 'random_state': 42, 'n_jobs': -1, 'max_depth': 20}
         default_params.update(model_params)
@@ -237,6 +269,20 @@ def build_sklearn_pipeline(model_type: str,
         default_params = {'max_iter': 100, 'random_state': 42, 'max_depth': 10}
         default_params.update(model_params)
         regressor = HistGradientBoostingRegressor(**default_params)
+    elif model_type == 'xgboost':
+        if not XGBOOST_AVAILABLE:
+            raise ImportError("XGBoost not installed. Install with: pip install xgboost")
+        default_params = {'n_estimators': 200, 'max_depth': 6, 'learning_rate': 0.1,
+                          'random_state': 42, 'n_jobs': -1}
+        default_params.update(model_params)
+        regressor = XGBRegressor(**default_params)
+    elif model_type == 'lightgbm':
+        if not LIGHTGBM_AVAILABLE:
+            raise ImportError("LightGBM not installed. Install with: pip install lightgbm")
+        default_params = {'n_estimators': 200, 'max_depth': 6, 'learning_rate': 0.1,
+                          'random_state': 42, 'n_jobs': -1, 'verbose': -1}
+        default_params.update(model_params)
+        regressor = LGBMRegressor(**default_params)
     else:
         raise ValueError(f"Unknown model type: {model_type}")
 

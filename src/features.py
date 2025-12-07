@@ -316,11 +316,24 @@ def find_close_model_number(model_code: str, available_models: List[str], max_de
     return best_match
 
 
+def _clean_price_column(series: pd.Series) -> pd.Series:
+    """Convert price strings like '$14,813.00*' to numeric."""
+    return pd.to_numeric(
+        series.astype(str)
+        .str.replace(r'[$,*]', '', regex=True)
+        .str.strip(),
+        errors='coerce'
+    )
+
+
 def build_cpu_lookup(df_cpu: pd.DataFrame) -> pd.DataFrame:
     """Build CPU benchmark lookup table with normalized keys."""
+    # Work with a copy to avoid modifying the original
+    df_cpu_copy = df_cpu.copy()
+
     # Parse CPU names in benchmark data
-    cpu_parsed = df_cpu["CPU Name"].apply(parse_cpu_name).apply(pd.Series)
-    df_cpu_enhanced = pd.concat([df_cpu, cpu_parsed], axis=1)
+    cpu_parsed = df_cpu_copy["CPU Name"].apply(parse_cpu_name).apply(pd.Series)
+    df_cpu_enhanced = pd.concat([df_cpu_copy, cpu_parsed], axis=1)
 
     # Rename benchmark columns
     bench_cols = {
@@ -331,9 +344,16 @@ def build_cpu_lookup(df_cpu: pd.DataFrame) -> pd.DataFrame:
         "Price (USD)": "cpu_bench_price_usd",
     }
 
+    df_cpu_enhanced = df_cpu_enhanced.rename(columns=bench_cols)
+
+    # Clean price column to numeric
+    df_cpu_enhanced["cpu_bench_price_usd"] = _clean_price_column(
+        df_cpu_enhanced["cpu_bench_price_usd"]
+    )
+
     # Keep best benchmark per normalized key
     df_lookup = (
-        df_cpu_enhanced.rename(columns=bench_cols)
+        df_cpu_enhanced
         .sort_values("cpu_bench_mark", ascending=False)
         .drop_duplicates(subset=["cpu_normalized_key"], keep="first")
     )
@@ -396,6 +416,10 @@ def match_cpu_benchmarks(df_comp: pd.DataFrame, df_cpu: pd.DataFrame,
         bench_cols = ["cpu_bench_name", "cpu_bench_mark", "cpu_bench_rank",
                       "cpu_bench_value", "cpu_bench_price_usd"]
         fuzzy_df = fuzzy_df.rename(columns={col: f"{col}_fuzzy" for col in bench_cols})
+        # Only keep columns needed for the merge to avoid column conflicts
+        fuzzy_merge_cols = ["cpu_normalized_key", "cpu_bench_match_key", "cpu_match_score_fuzzy"] + \
+                           [f"{col}_fuzzy" for col in bench_cols]
+        fuzzy_df = fuzzy_df[[c for c in fuzzy_merge_cols if c in fuzzy_df.columns]]
         df = df.merge(fuzzy_df, on="cpu_normalized_key", how="left")
 
         # Fill in fuzzy matches
@@ -663,9 +687,12 @@ def parse_gpu_name(raw: Optional[str]) -> Dict[str, Optional[str]]:
 
 def build_gpu_lookup(df_gpu: pd.DataFrame) -> pd.DataFrame:
     """Build GPU benchmark lookup table with normalized keys."""
+    # Work with a copy to avoid modifying the original
+    df_gpu_copy = df_gpu.copy()
+
     # Parse GPU names in benchmark data
-    gpu_parsed = df_gpu["Videocard Name"].apply(parse_gpu_name).apply(pd.Series)
-    df_gpu_enhanced = pd.concat([df_gpu, gpu_parsed], axis=1)
+    gpu_parsed = df_gpu_copy["Videocard Name"].apply(parse_gpu_name).apply(pd.Series)
+    df_gpu_enhanced = pd.concat([df_gpu_copy, gpu_parsed], axis=1)
 
     # Rename benchmark columns
     bench_cols = {
@@ -676,9 +703,16 @@ def build_gpu_lookup(df_gpu: pd.DataFrame) -> pd.DataFrame:
         "Price (USD)": "gpu_bench_price_usd",
     }
 
+    df_gpu_enhanced = df_gpu_enhanced.rename(columns=bench_cols)
+
+    # Clean price column to numeric
+    df_gpu_enhanced["gpu_bench_price_usd"] = _clean_price_column(
+        df_gpu_enhanced["gpu_bench_price_usd"]
+    )
+
     # Keep best benchmark per normalized key
     df_lookup = (
-        df_gpu_enhanced.rename(columns=bench_cols)
+        df_gpu_enhanced
         .sort_values("gpu_bench_mark", ascending=False)
         .drop_duplicates(subset=["gpu_normalized_key"], keep="first")
     )
@@ -747,6 +781,10 @@ def match_gpu_benchmarks(df_comp: pd.DataFrame, df_gpu: pd.DataFrame,
         bench_cols = ["gpu_bench_name", "gpu_bench_mark", "gpu_bench_rank",
                       "gpu_bench_value", "gpu_bench_price_usd"]
         fuzzy_df = fuzzy_df.rename(columns={col: f"{col}_fuzzy" for col in bench_cols})
+        # Only keep columns needed for the merge to avoid column conflicts
+        fuzzy_merge_cols = ["gpu_normalized_key", "gpu_bench_match_key", "gpu_match_score_fuzzy"] + \
+                           [f"{col}_fuzzy" for col in bench_cols]
+        fuzzy_df = fuzzy_df[[c for c in fuzzy_merge_cols if c in fuzzy_df.columns]]
         df = df.merge(fuzzy_df, on="gpu_normalized_key", how="left")
 
         # Fill in fuzzy matches
@@ -1220,14 +1258,24 @@ def construir_features(df_computers: pd.DataFrame,
     print("\n8. Matching CPU benchmarks...")
     df = match_cpu_benchmarks(df, df_cpu, "Procesador_Procesador")
     df['_cpu_mark'] = df['cpu_bench_mark']
+    df['_cpu_rank'] = df['cpu_bench_rank']
+    df['_cpu_value'] = df['cpu_bench_value']
     df['_cpu_price_usd'] = df['cpu_bench_price_usd']
+    print(f"   CPU mark: {df['_cpu_mark'].notna().sum():,}")
+    print(f"   CPU rank: {df['_cpu_rank'].notna().sum():,}")
+    print(f"   CPU value: {df['_cpu_value'].notna().sum():,}")
     print(f"   CPU price: {df['_cpu_price_usd'].notna().sum():,}")
 
     # 9. GPU benchmarks (with parsing and matching)
     print("\n9. Matching GPU benchmarks...")
     df = match_gpu_benchmarks(df, df_gpu, "Gráfica_Tarjeta gráfica")
     df['_gpu_mark'] = df['gpu_bench_mark']
+    df['_gpu_rank'] = df['gpu_bench_rank']
+    df['_gpu_value'] = df['gpu_bench_value']
     df['_gpu_price_usd'] = df['gpu_bench_price_usd']
+    print(f"   GPU mark: {df['_gpu_mark'].notna().sum():,}")
+    print(f"   GPU rank: {df['_gpu_rank'].notna().sum():,}")
+    print(f"   GPU value: {df['_gpu_value'].notna().sum():,}")
     print(f"   GPU price: {df['_gpu_price_usd'].notna().sum():,}")
 
     # 10. GPU memory
@@ -1285,12 +1333,16 @@ def construir_features(df_computers: pd.DataFrame,
 
 def prepare_modeling_data(df: pd.DataFrame,
                           target_col: str = '_precio_num',
-                          max_missing_pct: float = 0.60) -> pd.DataFrame:
+                          max_missing_pct: float = 0.60,
+                          remove_outliers: bool = True,
+                          outlier_lower_pct: float = 0.01,
+                          outlier_upper_pct: float = 0.99) -> pd.DataFrame:
     """
     Prepare data for modeling by:
     1. Removing rows without valid target
-    2. Removing features with >max_missing_pct missing values
-    3. Selecting only engineered features (starting with _) plus useful metadata
+    2. Removing price outliers (optional)
+    3. Removing columns (both engineered and original) with >max_missing_pct missing values
+    4. Including both engineered features and original columns that pass the missing value threshold
 
     Parameters
     ----------
@@ -1300,6 +1352,12 @@ def prepare_modeling_data(df: pd.DataFrame,
         Name of the target column
     max_missing_pct : float
         Maximum allowed missing value percentage (0.60 = 60%)
+    remove_outliers : bool
+        Whether to remove price outliers (default True)
+    outlier_lower_pct : float
+        Lower percentile for outlier removal (default 0.01 = 1st percentile)
+    outlier_upper_pct : float
+        Upper percentile for outlier removal (default 0.99 = 99th percentile)
 
     Returns
     -------
@@ -1319,20 +1377,55 @@ def prepare_modeling_data(df: pd.DataFrame,
     print(f"\n1. Dropped {rows_dropped:,} rows with missing target")
     print(f"   Remaining rows: {len(df_model):,}")
 
-    # 2. Identify engineered features
-    engineered_cols = [c for c in df_model.columns if c.startswith('_')]
-    print(f"\n2. Found {len(engineered_cols)} engineered features")
+    # 2. Remove price outliers (if enabled)
+    if remove_outliers:
+        before_outliers = len(df_model)
+        p_low = df_model[target_col].quantile(outlier_lower_pct)
+        p_high = df_model[target_col].quantile(outlier_upper_pct)
+        df_model = df_model[(df_model[target_col] >= p_low) & (df_model[target_col] <= p_high)]
+        outliers_removed = before_outliers - len(df_model)
+        print(f"\n2. Removed {outliers_removed:,} price outliers ({outlier_lower_pct*100:.0f}th-{outlier_upper_pct*100:.0f}th percentile)")
+        print(f"   Price range kept: €{p_low:,.0f} - €{p_high:,.0f}")
+        print(f"   Remaining rows: {len(df_model):,}")
 
-    # 3. Analyze and remove features with too many missing values
-    print(f"\n3. Filtering features with >{max_missing_pct*100:.0f}% missing values...")
+    # 3. Identify all columns (engineered and original)
+    engineered_cols = [c for c in df_model.columns if c.startswith('_')]
+    original_cols = [c for c in df_model.columns if not c.startswith('_')]
+
+    # Exclude intermediate/parsing columns that shouldn't be in final model
+    exclude_patterns = [
+        # CPU parsing intermediates
+        'cpu_name_clean', 'cpu_normalized_key', 'cpu_parse_status',
+        'cpu_bench_name', 'cpu_bench_mark', 'cpu_bench_rank', 'cpu_bench_value', 'cpu_bench_price_usd',
+        'cpu_model_code', 'cpu_suffix',
+        'cpu_match_score', 'cpu_match_strategy',  # Match metadata
+        # GPU parsing intermediates
+        'gpu_name_clean', 'gpu_normalized_key', 'gpu_parse_status',
+        'gpu_bench_name', 'gpu_bench_mark', 'gpu_bench_rank', 'gpu_bench_value', 'gpu_bench_price_usd',
+        'gpu_model_number', 'gpu_suffix',
+        'gpu_match_score', 'gpu_match_strategy',  # Match metadata
+        # Raw text columns
+        'Título', 'Precio_Rango', 'Serie',
+        # Dataset-specific columns that shouldn't be features
+        'Ofertas', 'Num_ofertas', 'num_ofertas',
+    ]
+
+    original_cols = [c for c in original_cols if c not in exclude_patterns]
+
+    all_candidate_cols = engineered_cols + original_cols
+    print(f"\n3. Found {len(engineered_cols)} engineered features + {len(original_cols)} original columns")
+
+    # 4. Analyze and remove columns with too many missing values
+    print(f"\n4. Filtering columns with >{max_missing_pct*100:.0f}% missing values...")
 
     missing_analysis = []
-    for col in engineered_cols:
+    for col in all_candidate_cols:
         missing_pct = df_model[col].isna().mean()
         missing_analysis.append({
             'column': col,
             'missing_pct': missing_pct,
-            'keep': missing_pct <= max_missing_pct
+            'keep': missing_pct <= max_missing_pct,
+            'is_engineered': col.startswith('_')
         })
 
     missing_df = pd.DataFrame(missing_analysis).sort_values('missing_pct', ascending=False)
@@ -1342,38 +1435,37 @@ def prepare_modeling_data(df: pd.DataFrame,
     kept_features = missing_df[missing_df['keep']]['column'].tolist()
 
     if removed_features:
-        print(f"\n   Removing {len(removed_features)} features with >{max_missing_pct*100:.0f}% missing:")
-        for col in removed_features:
+        print(f"\n   Removing {len(removed_features)} columns with >{max_missing_pct*100:.0f}% missing:")
+        for col in removed_features[:15]:  # Show first 15
             pct = missing_df[missing_df['column'] == col]['missing_pct'].iloc[0]
             print(f"      - {col}: {pct*100:.1f}% missing")
+        if len(removed_features) > 15:
+            print(f"      ... and {len(removed_features) - 15} more")
 
-    print(f"\n   Keeping {len(kept_features)} features with <={max_missing_pct*100:.0f}% missing")
+    kept_engineered = [c for c in kept_features if c.startswith('_')]
+    kept_original = [c for c in kept_features if not c.startswith('_')]
+    print(f"\n   Keeping {len(kept_engineered)} engineered features + {len(kept_original)} original columns")
 
-    # 4. Select columns for modeling
-    # Include kept engineered features + useful categorical columns for analysis
-    metadata_cols = ['_brand', '_serie']
-    benchmark_cols = ['cpu_match_strategy', 'gpu_match_strategy']
+    # 5. Select columns for modeling
+    final_cols = kept_features.copy()
 
-    final_cols = kept_features + [c for c in metadata_cols if c in kept_features]
-    final_cols = list(dict.fromkeys(final_cols))  # Remove duplicates, preserve order
-
-    # Also keep match strategy columns for analysis
-    for col in benchmark_cols:
-        if col in df_model.columns:
-            final_cols.append(col)
+    # Remove duplicates while preserving order
+    final_cols = list(dict.fromkeys(final_cols))
 
     df_final = df_model[final_cols].copy()
 
-    print(f"\n4. Final dataset shape: {df_final.shape}")
+    print(f"\n5. Final dataset shape: {df_final.shape}")
     print(f"   - Rows: {len(df_final):,}")
-    print(f"   - Features: {len(df_final.columns)}")
+    print(f"   - Engineered features: {len(kept_engineered)}")
+    print(f"   - Original columns: {len(kept_original)}")
+    print(f"   - Total columns: {len(df_final.columns)}")
 
-    # 5. Show summary of remaining missing values
+    # 6. Show summary of remaining missing values
     remaining_missing = df_final[kept_features].isna().mean() * 100
     remaining_missing = remaining_missing[remaining_missing > 0].sort_values(ascending=False)
 
     if len(remaining_missing) > 0:
-        print(f"\n5. Remaining missing values (to be imputed by model):")
+        print(f"\n6. Remaining missing values (to be imputed by model):")
         for col, pct in remaining_missing.head(10).items():
             print(f"      {col}: {pct:.1f}%")
         if len(remaining_missing) > 10:
@@ -1397,10 +1489,11 @@ def get_feature_columns(df: pd.DataFrame, target_col: str = '_precio_num') -> Tu
         - numeric_features: Numeric feature names
         - categorical_features: Categorical feature names
     """
-    # Exclude target and metadata columns
-    exclude_cols = [target_col, 'cpu_match_strategy', 'gpu_match_strategy']
+    # Exclude target column
+    exclude_cols = [target_col]
 
-    all_features = [c for c in df.columns if c.startswith('_') and c not in exclude_cols]
+    # Include both engineered features (_) and original columns
+    all_features = [c for c in df.columns if c not in exclude_cols]
 
     numeric_features = []
     categorical_features = []

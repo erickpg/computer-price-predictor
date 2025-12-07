@@ -165,16 +165,20 @@ def build_preprocessor(numeric_cols: List[str],
     ColumnTransformer
         Preprocessing transformer
     """
+    from sklearn.preprocessing import FunctionTransformer
+
     # Numeric: impute with median, then scale
     numeric_transformer = Pipeline(steps=[
         ('imputer', SimpleImputer(strategy='median')),
         ('scaler', StandardScaler())
     ])
 
-    # Categorical: impute with constant, then one-hot encode
+    # Categorical: convert to string, impute with constant, then one-hot encode
+    # The string conversion handles mixed types (bool, str, etc.)
     categorical_transformer = Pipeline(steps=[
+        ('to_string', FunctionTransformer(lambda X: X.astype(str))),
         ('imputer', SimpleImputer(strategy='constant', fill_value='missing')),
-        ('onehot', OneHotEncoder(handle_unknown='ignore', sparse_output=False, max_categories=50))
+        ('onehot', OneHotEncoder(handle_unknown='ignore', sparse=False))
     ])
 
     transformers = []

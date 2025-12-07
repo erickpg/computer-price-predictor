@@ -283,11 +283,57 @@ def parse_cpu_name(raw: Optional[str]) -> Dict[str, Optional[str]]:
     }
 
 
+def find_close_model_number(model_code: str, available_models: List[str], max_delta: int = 10) -> Optional[str]:
+    """
+    Find a close model number from available models.
+
+    For example, if looking for '617' and we have ['615', '615e', '620'],
+    this will return the closest one within max_delta.
+    """
+    if not model_code or not available_models:
+        return None
+
+    # Extract numeric part from model code
+    base_match = re.match(r'(\d+)', model_code)
+    if not base_match:
+        return None
+
+    base_num = int(base_match.group(1))
+
+    # Find closest match
+    best_match = None
+    best_delta = float('inf')
+
+    for candidate in available_models:
+        cand_match = re.match(r'(\d+)', candidate)
+        if cand_match:
+            cand_num = int(cand_match.group(1))
+            delta = abs(cand_num - base_num)
+            if delta <= max_delta and delta < best_delta:
+                best_delta = delta
+                best_match = candidate
+
+    return best_match
+
+
+def _clean_price_column(series: pd.Series) -> pd.Series:
+    """Convert price strings like '$14,813.00*' to numeric."""
+    return pd.to_numeric(
+        series.astype(str)
+        .str.replace(r'[$,*]', '', regex=True)
+        .str.strip(),
+        errors='coerce'
+    )
+
+
 def build_cpu_lookup(df_cpu: pd.DataFrame) -> pd.DataFrame:
     """Build CPU benchmark lookup table with normalized keys."""
+    # Work with a copy to avoid modifying the original
+    df_cpu_copy = df_cpu.copy()
+
     # Parse CPU names in benchmark data
-    cpu_parsed = df_cpu["CPU Name"].apply(parse_cpu_name).apply(pd.Series)
-    df_cpu_enhanced = pd.concat([df_cpu, cpu_parsed], axis=1)
+    cpu_parsed = df_cpu_copy["CPU Name"].apply(parse_cpu_name).apply(pd.Series)
+    df_cpu_enhanced = pd.concat([df_cpu_copy, cpu_parsed], axis=1)
 
     # Rename benchmark columns
     bench_cols = {
@@ -298,23 +344,31 @@ def build_cpu_lookup(df_cpu: pd.DataFrame) -> pd.DataFrame:
         "Price (USD)": "cpu_bench_price_usd",
     }
 
+    df_cpu_enhanced = df_cpu_enhanced.rename(columns=bench_cols)
+
+    # Clean price column to numeric
+    df_cpu_enhanced["cpu_bench_price_usd"] = _clean_price_column(
+        df_cpu_enhanced["cpu_bench_price_usd"]
+    )
+
     # Keep best benchmark per normalized key
     df_lookup = (
-        df_cpu_enhanced.rename(columns=bench_cols)
+        df_cpu_enhanced
         .sort_values("cpu_bench_mark", ascending=False)
         .drop_duplicates(subset=["cpu_normalized_key"], keep="first")
     )
 
     return df_lookup[[
         "cpu_normalized_key", "cpu_bench_name", "cpu_bench_mark",
-        "cpu_bench_rank", "cpu_bench_value", "cpu_bench_price_usd"
+        "cpu_bench_rank", "cpu_bench_value", "cpu_bench_price_usd",
+        "cpu_brand", "cpu_family", "cpu_model_code"
     ]]
 
 
 def match_cpu_benchmarks(df_comp: pd.DataFrame, df_cpu: pd.DataFrame,
                          cpu_col: str = "Procesador_Procesador",
                          fuzzy_cutoff: float = 0.82) -> pd.DataFrame:
-    """Match CPU benchmarks using exact + fuzzy matching."""
+    """Match CPU benchmarks using exact + fuzzy + close neighbor + family mean."""
     df = df_comp.copy()
 
     # Parse CPU names in computer data
@@ -362,6 +416,10 @@ def match_cpu_benchmarks(df_comp: pd.DataFrame, df_cpu: pd.DataFrame,
         bench_cols = ["cpu_bench_name", "cpu_bench_mark", "cpu_bench_rank",
                       "cpu_bench_value", "cpu_bench_price_usd"]
         fuzzy_df = fuzzy_df.rename(columns={col: f"{col}_fuzzy" for col in bench_cols})
+        # Only keep columns needed for the merge to avoid column conflicts
+        fuzzy_merge_cols = ["cpu_normalized_key", "cpu_bench_match_key", "cpu_match_score_fuzzy"] + \
+                           [f"{col}_fuzzy" for col in bench_cols]
+        fuzzy_df = fuzzy_df[[c for c in fuzzy_merge_cols if c in fuzzy_df.columns]]
         df = df.merge(fuzzy_df, on="cpu_normalized_key", how="left")
 
         # Fill in fuzzy matches
@@ -381,6 +439,118 @@ def match_cpu_benchmarks(df_comp: pd.DataFrame, df_cpu: pd.DataFrame,
 
         if "cpu_bench_match_key" in df.columns:
             df.drop(columns=["cpu_bench_match_key"], inplace=True)
+
+    # Close neighbor matching for remaining unmatched
+    print("Performing close neighbor CPU matches...")
+    still_unmatched = df["cpu_match_strategy"] == "unmatched"
+
+    if still_unmatched.sum() > 0:
+        neighbor_matches = []
+
+        for idx in df[still_unmatched].index:
+            brand = df.loc[idx, "cpu_brand"]
+            family = df.loc[idx, "cpu_family"]
+            model_code = df.loc[idx, "cpu_model_code"]
+
+            if pd.isna(brand) or pd.isna(family) or pd.isna(model_code):
+                continue
+
+            # Find CPUs with same brand and family in lookup
+            same_family = cpu_lookup[
+                (cpu_lookup["cpu_brand"] == brand) &
+                (cpu_lookup["cpu_family"] == family)
+            ]
+
+            if len(same_family) == 0:
+                continue
+
+            # Try to find close model number
+            available_models = same_family["cpu_model_code"].dropna().tolist()
+            close_model = find_close_model_number(model_code, available_models)
+
+            if close_model:
+                match_row = same_family[same_family["cpu_model_code"] == close_model].iloc[0]
+                neighbor_matches.append({
+                    "idx": idx,
+                    "cpu_bench_name": match_row["cpu_bench_name"],
+                    "cpu_bench_mark": match_row["cpu_bench_mark"],
+                    "cpu_bench_rank": match_row["cpu_bench_rank"],
+                    "cpu_bench_value": match_row["cpu_bench_value"],
+                    "cpu_bench_price_usd": match_row["cpu_bench_price_usd"],
+                    "strategy": "neighbor",
+                })
+
+        # Apply neighbor matches
+        for match in neighbor_matches:
+            idx = match["idx"]
+            df.loc[idx, "cpu_bench_name"] = match["cpu_bench_name"]
+            df.loc[idx, "cpu_bench_mark"] = match["cpu_bench_mark"]
+            df.loc[idx, "cpu_bench_rank"] = match["cpu_bench_rank"]
+            df.loc[idx, "cpu_bench_value"] = match["cpu_bench_value"]
+            df.loc[idx, "cpu_bench_price_usd"] = match["cpu_bench_price_usd"]
+            df.loc[idx, "cpu_match_strategy"] = "neighbor"
+            df.loc[idx, "cpu_match_score"] = 0.9
+
+        print(f"  Neighbor matches: {len(neighbor_matches)}")
+
+    # Family mean imputation for remaining unmatched
+    print("Computing family mean for remaining unmatched CPUs...")
+    still_unmatched = df["cpu_match_strategy"] == "unmatched"
+
+    if still_unmatched.sum() > 0:
+        # Compute family means from lookup table
+        family_means = cpu_lookup.groupby(["cpu_brand", "cpu_family"]).agg({
+            "cpu_bench_mark": "mean",
+            "cpu_bench_price_usd": "mean",
+        }).reset_index()
+
+        # Compute brand-level means as fallback
+        brand_means = cpu_lookup.groupby("cpu_brand").agg({
+            "cpu_bench_mark": "mean",
+            "cpu_bench_price_usd": "mean",
+        }).reset_index()
+
+        family_imputed = 0
+        brand_imputed = 0
+
+        for idx in df[still_unmatched].index:
+            brand = df.loc[idx, "cpu_brand"]
+            family = df.loc[idx, "cpu_family"]
+
+            if pd.isna(brand):
+                continue
+
+            # Try family mean first
+            if pd.notna(family):
+                family_match = family_means[
+                    (family_means["cpu_brand"] == brand) &
+                    (family_means["cpu_family"] == family)
+                ]
+                if len(family_match) > 0:
+                    df.loc[idx, "cpu_bench_mark"] = family_match["cpu_bench_mark"].iloc[0]
+                    df.loc[idx, "cpu_bench_price_usd"] = family_match["cpu_bench_price_usd"].iloc[0]
+                    df.loc[idx, "cpu_match_strategy"] = "family_mean"
+                    df.loc[idx, "cpu_match_score"] = 0.7
+                    family_imputed += 1
+                    continue
+
+            # Fall back to brand mean
+            brand_match = brand_means[brand_means["cpu_brand"] == brand]
+            if len(brand_match) > 0:
+                df.loc[idx, "cpu_bench_mark"] = brand_match["cpu_bench_mark"].iloc[0]
+                df.loc[idx, "cpu_bench_price_usd"] = brand_match["cpu_bench_price_usd"].iloc[0]
+                df.loc[idx, "cpu_match_strategy"] = "brand_mean"
+                df.loc[idx, "cpu_match_score"] = 0.5
+                brand_imputed += 1
+
+        print(f"  Family mean imputations: {family_imputed}")
+        print(f"  Brand mean imputations: {brand_imputed}")
+
+    # Clean up extra columns from lookup merge
+    extra_cols = ["cpu_brand_bench", "cpu_family_bench", "cpu_model_code_bench"]
+    for col in extra_cols:
+        if col in df.columns:
+            df.drop(columns=[col], inplace=True)
 
     # Report results
     print("\nCPU match strategy distribution:")
@@ -517,9 +687,12 @@ def parse_gpu_name(raw: Optional[str]) -> Dict[str, Optional[str]]:
 
 def build_gpu_lookup(df_gpu: pd.DataFrame) -> pd.DataFrame:
     """Build GPU benchmark lookup table with normalized keys."""
+    # Work with a copy to avoid modifying the original
+    df_gpu_copy = df_gpu.copy()
+
     # Parse GPU names in benchmark data
-    gpu_parsed = df_gpu["Videocard Name"].apply(parse_gpu_name).apply(pd.Series)
-    df_gpu_enhanced = pd.concat([df_gpu, gpu_parsed], axis=1)
+    gpu_parsed = df_gpu_copy["Videocard Name"].apply(parse_gpu_name).apply(pd.Series)
+    df_gpu_enhanced = pd.concat([df_gpu_copy, gpu_parsed], axis=1)
 
     # Rename benchmark columns
     bench_cols = {
@@ -530,23 +703,31 @@ def build_gpu_lookup(df_gpu: pd.DataFrame) -> pd.DataFrame:
         "Price (USD)": "gpu_bench_price_usd",
     }
 
+    df_gpu_enhanced = df_gpu_enhanced.rename(columns=bench_cols)
+
+    # Clean price column to numeric
+    df_gpu_enhanced["gpu_bench_price_usd"] = _clean_price_column(
+        df_gpu_enhanced["gpu_bench_price_usd"]
+    )
+
     # Keep best benchmark per normalized key
     df_lookup = (
-        df_gpu_enhanced.rename(columns=bench_cols)
+        df_gpu_enhanced
         .sort_values("gpu_bench_mark", ascending=False)
         .drop_duplicates(subset=["gpu_normalized_key"], keep="first")
     )
 
     return df_lookup[[
         "gpu_normalized_key", "gpu_bench_name", "gpu_bench_mark",
-        "gpu_bench_rank", "gpu_bench_value", "gpu_bench_price_usd"
+        "gpu_bench_rank", "gpu_bench_value", "gpu_bench_price_usd",
+        "gpu_brand", "gpu_series", "gpu_model_number"
     ]]
 
 
 def match_gpu_benchmarks(df_comp: pd.DataFrame, df_gpu: pd.DataFrame,
                          gpu_col: str = "Gráfica_Tarjeta gráfica",
                          fuzzy_cutoff: float = 0.80) -> pd.DataFrame:
-    """Match GPU benchmarks using exact + fuzzy matching."""
+    """Match GPU benchmarks using exact + fuzzy + close neighbor + series mean."""
     df = df_comp.copy()
 
     # Parse GPU names in computer data
@@ -600,6 +781,10 @@ def match_gpu_benchmarks(df_comp: pd.DataFrame, df_gpu: pd.DataFrame,
         bench_cols = ["gpu_bench_name", "gpu_bench_mark", "gpu_bench_rank",
                       "gpu_bench_value", "gpu_bench_price_usd"]
         fuzzy_df = fuzzy_df.rename(columns={col: f"{col}_fuzzy" for col in bench_cols})
+        # Only keep columns needed for the merge to avoid column conflicts
+        fuzzy_merge_cols = ["gpu_normalized_key", "gpu_bench_match_key", "gpu_match_score_fuzzy"] + \
+                           [f"{col}_fuzzy" for col in bench_cols]
+        fuzzy_df = fuzzy_df[[c for c in fuzzy_merge_cols if c in fuzzy_df.columns]]
         df = df.merge(fuzzy_df, on="gpu_normalized_key", how="left")
 
         # Fill in fuzzy matches
@@ -619,6 +804,118 @@ def match_gpu_benchmarks(df_comp: pd.DataFrame, df_gpu: pd.DataFrame,
 
         if "gpu_bench_match_key" in df.columns:
             df.drop(columns=["gpu_bench_match_key"], inplace=True)
+
+    # Close neighbor matching for remaining unmatched discrete GPUs
+    print("Performing close neighbor GPU matches...")
+    still_unmatched = (df["gpu_match_strategy"] == "unmatched") & (df["gpu_is_integrated"] != True)
+
+    if still_unmatched.sum() > 0:
+        neighbor_matches = []
+
+        for idx in df[still_unmatched].index:
+            brand = df.loc[idx, "gpu_brand"]
+            series = df.loc[idx, "gpu_series"]
+            model_number = df.loc[idx, "gpu_model_number"]
+
+            if pd.isna(brand) or pd.isna(series) or pd.isna(model_number):
+                continue
+
+            # Find GPUs with same brand and series in lookup
+            same_series = gpu_lookup[
+                (gpu_lookup["gpu_brand"] == brand) &
+                (gpu_lookup["gpu_series"] == series)
+            ]
+
+            if len(same_series) == 0:
+                continue
+
+            # Try to find close model number
+            available_models = same_series["gpu_model_number"].dropna().tolist()
+            close_model = find_close_model_number(model_number, available_models, max_delta=20)
+
+            if close_model:
+                match_row = same_series[same_series["gpu_model_number"] == close_model].iloc[0]
+                neighbor_matches.append({
+                    "idx": idx,
+                    "gpu_bench_name": match_row["gpu_bench_name"],
+                    "gpu_bench_mark": match_row["gpu_bench_mark"],
+                    "gpu_bench_rank": match_row["gpu_bench_rank"],
+                    "gpu_bench_value": match_row["gpu_bench_value"],
+                    "gpu_bench_price_usd": match_row["gpu_bench_price_usd"],
+                    "strategy": "neighbor",
+                })
+
+        # Apply neighbor matches
+        for match in neighbor_matches:
+            idx = match["idx"]
+            df.loc[idx, "gpu_bench_name"] = match["gpu_bench_name"]
+            df.loc[idx, "gpu_bench_mark"] = match["gpu_bench_mark"]
+            df.loc[idx, "gpu_bench_rank"] = match["gpu_bench_rank"]
+            df.loc[idx, "gpu_bench_value"] = match["gpu_bench_value"]
+            df.loc[idx, "gpu_bench_price_usd"] = match["gpu_bench_price_usd"]
+            df.loc[idx, "gpu_match_strategy"] = "neighbor"
+            df.loc[idx, "gpu_match_score"] = 0.9
+
+        print(f"  Neighbor matches: {len(neighbor_matches)}")
+
+    # Series mean imputation for remaining unmatched discrete GPUs
+    print("Computing series mean for remaining unmatched GPUs...")
+    still_unmatched = (df["gpu_match_strategy"] == "unmatched") & (df["gpu_is_integrated"] != True)
+
+    if still_unmatched.sum() > 0:
+        # Compute series means from lookup table
+        series_means = gpu_lookup.groupby(["gpu_brand", "gpu_series"]).agg({
+            "gpu_bench_mark": "mean",
+            "gpu_bench_price_usd": "mean",
+        }).reset_index()
+
+        # Compute brand-level means as fallback
+        brand_means = gpu_lookup.groupby("gpu_brand").agg({
+            "gpu_bench_mark": "mean",
+            "gpu_bench_price_usd": "mean",
+        }).reset_index()
+
+        series_imputed = 0
+        brand_imputed = 0
+
+        for idx in df[still_unmatched].index:
+            brand = df.loc[idx, "gpu_brand"]
+            series = df.loc[idx, "gpu_series"]
+
+            if pd.isna(brand):
+                continue
+
+            # Try series mean first
+            if pd.notna(series):
+                series_match = series_means[
+                    (series_means["gpu_brand"] == brand) &
+                    (series_means["gpu_series"] == series)
+                ]
+                if len(series_match) > 0:
+                    df.loc[idx, "gpu_bench_mark"] = series_match["gpu_bench_mark"].iloc[0]
+                    df.loc[idx, "gpu_bench_price_usd"] = series_match["gpu_bench_price_usd"].iloc[0]
+                    df.loc[idx, "gpu_match_strategy"] = "series_mean"
+                    df.loc[idx, "gpu_match_score"] = 0.7
+                    series_imputed += 1
+                    continue
+
+            # Fall back to brand mean
+            brand_match = brand_means[brand_means["gpu_brand"] == brand]
+            if len(brand_match) > 0:
+                df.loc[idx, "gpu_bench_mark"] = brand_match["gpu_bench_mark"].iloc[0]
+                df.loc[idx, "gpu_bench_price_usd"] = brand_match["gpu_bench_price_usd"].iloc[0]
+                df.loc[idx, "gpu_match_strategy"] = "brand_mean"
+                df.loc[idx, "gpu_match_score"] = 0.5
+                brand_imputed += 1
+
+        print(f"  Series mean imputations: {series_imputed}")
+        print(f"  Brand mean imputations: {brand_imputed}")
+
+    # Clean up extra columns from lookup merge
+    extra_cols = ["gpu_brand_bench", "gpu_series_bench", "gpu_model_number_bench"]
+    for col in extra_cols:
+        if col in df.columns:
+            df.drop(columns=[col], inplace=True)
 
     # Report results
     print("\nGPU match strategy distribution:")
@@ -861,12 +1158,6 @@ def extraer_gpu_memory_gb(gpu_mem_str: str) -> Optional[float]:
     return np.nan
 
 
-def extraer_num_ofertas(ofertas_str: str) -> Optional[int]:
-    """Extract number of offers."""
-    if pd.isna(ofertas_str):
-        return np.nan
-    match = re.search(r'(\d+)\s+ofertas?', str(ofertas_str), re.IGNORECASE)
-    return int(match.group(1)) if match else np.nan
 
 
 def tiene_wifi(conectividad_str: str) -> Optional[int]:
@@ -967,54 +1258,63 @@ def construir_features(df_computers: pd.DataFrame,
     print("\n8. Matching CPU benchmarks...")
     df = match_cpu_benchmarks(df, df_cpu, "Procesador_Procesador")
     df['_cpu_mark'] = df['cpu_bench_mark']
+    df['_cpu_rank'] = df['cpu_bench_rank']
+    df['_cpu_value'] = df['cpu_bench_value']
+    df['_cpu_price_usd'] = df['cpu_bench_price_usd']
+    print(f"   CPU mark: {df['_cpu_mark'].notna().sum():,}")
+    print(f"   CPU rank: {df['_cpu_rank'].notna().sum():,}")
+    print(f"   CPU value: {df['_cpu_value'].notna().sum():,}")
+    print(f"   CPU price: {df['_cpu_price_usd'].notna().sum():,}")
 
     # 9. GPU benchmarks (with parsing and matching)
     print("\n9. Matching GPU benchmarks...")
     df = match_gpu_benchmarks(df, df_gpu, "Gráfica_Tarjeta gráfica")
     df['_gpu_mark'] = df['gpu_bench_mark']
+    df['_gpu_rank'] = df['gpu_bench_rank']
+    df['_gpu_value'] = df['gpu_bench_value']
+    df['_gpu_price_usd'] = df['gpu_bench_price_usd']
+    print(f"   GPU mark: {df['_gpu_mark'].notna().sum():,}")
+    print(f"   GPU rank: {df['_gpu_rank'].notna().sum():,}")
+    print(f"   GPU value: {df['_gpu_value'].notna().sum():,}")
+    print(f"   GPU price: {df['_gpu_price_usd'].notna().sum():,}")
 
     # 10. GPU memory
     print("\n10. Extracting _gpu_memory_gb...")
     df['_gpu_memory_gb'] = df['Gráfica_Memoria gráfica'].apply(extraer_gpu_memory_gb)
     print(f"   GPU memory: {df['_gpu_memory_gb'].notna().sum():,}")
 
-    # 11. Number of offers
-    print("\n11. Extracting _num_ofertas...")
-    df['_num_ofertas'] = df['Ofertas'].apply(extraer_num_ofertas)
-    print(f"   Offers: {df['_num_ofertas'].notna().sum():,}")
-
-    # 12. Weight
-    print("\n12. Extracting _peso_kg...")
+    # 11. Weight
+    print("\n11. Extracting _peso_kg...")
     df['_peso_kg'] = df['Medidas y peso_Peso'].apply(extraer_peso_kg)
     print(f"   Weight: {df['_peso_kg'].notna().sum():,}")
 
-    # 13. Resolution
-    print("\n13. Extracting _resolucion_pixeles...")
+    # 12. Resolution
+    print("\n12. Extracting _resolucion_pixeles...")
     df['_resolucion_pixeles'] = df['Pantalla_Resolución de pantalla'].apply(extraer_resolucion_pixeles)
     print(f"   Resolution: {df['_resolucion_pixeles'].notna().sum():,}")
 
-    # 14. Refresh rate
-    print("\n14. Extracting _tasa_refresco_hz...")
+    # 13. Refresh rate
+    print("\n13. Extracting _tasa_refresco_hz...")
     df['_tasa_refresco_hz'] = df['Pantalla_Tasa de actualización de imagen'].apply(extraer_tasa_refresco)
     print(f"   Refresh rate: {df['_tasa_refresco_hz'].notna().sum():,}")
 
-    # 15. WiFi
-    print("\n15. Creating _tiene_wifi...")
+    # 14. WiFi
+    print("\n14. Creating _tiene_wifi...")
     df['_tiene_wifi'] = df['Comunicaciones_Conectividad'].apply(tiene_wifi)
     print(f"   WiFi: {df['_tiene_wifi'].notna().sum():,}")
 
-    # 16. Bluetooth
-    print("\n16. Creating _tiene_bluetooth...")
+    # 15. Bluetooth
+    print("\n15. Creating _tiene_bluetooth...")
     df['_tiene_bluetooth'] = df['Comunicaciones_Conectividad'].apply(tiene_bluetooth)
     print(f"   Bluetooth: {df['_tiene_bluetooth'].notna().sum():,}")
 
-    # 17. Webcam
-    print("\n17. Creating _tiene_webcam...")
+    # 16. Webcam
+    print("\n16. Creating _tiene_webcam...")
     df['_tiene_webcam'] = df['Cámara_Webcam'].apply(tiene_webcam)
     print(f"   Webcam: {df['_tiene_webcam'].notna().sum():,}")
 
-    # 18. Bluetooth version
-    print("\n18. Extracting _version_bluetooth...")
+    # 17. Bluetooth version
+    print("\n17. Extracting _version_bluetooth...")
     df['_version_bluetooth'] = df['Comunicaciones_Versión Bluetooth'].apply(extraer_version_bluetooth)
     print(f"   BT version: {df['_version_bluetooth'].notna().sum():,}")
 
@@ -1025,3 +1325,183 @@ def construir_features(df_computers: pd.DataFrame,
     print("=" * 60)
 
     return df
+
+
+# =============================================================================
+# DATA PREPARATION FOR MODELING
+# =============================================================================
+
+def prepare_modeling_data(df: pd.DataFrame,
+                          target_col: str = '_precio_num',
+                          max_missing_pct: float = 0.60,
+                          remove_outliers: bool = True,
+                          outlier_lower_pct: float = 0.01,
+                          outlier_upper_pct: float = 0.99) -> pd.DataFrame:
+    """
+    Prepare data for modeling by:
+    1. Removing rows without valid target
+    2. Removing price outliers (optional)
+    3. Removing columns (both engineered and original) with >max_missing_pct missing values
+    4. Including both engineered features and original columns that pass the missing value threshold
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        DataFrame with engineered features
+    target_col : str
+        Name of the target column
+    max_missing_pct : float
+        Maximum allowed missing value percentage (0.60 = 60%)
+    remove_outliers : bool
+        Whether to remove price outliers (default True)
+    outlier_lower_pct : float
+        Lower percentile for outlier removal (default 0.01 = 1st percentile)
+    outlier_upper_pct : float
+        Upper percentile for outlier removal (default 0.99 = 99th percentile)
+
+    Returns
+    -------
+    pd.DataFrame
+        Cleaned and prepared DataFrame for modeling
+    """
+    print("\n" + "=" * 60)
+    print("PREPARING DATA FOR MODELING")
+    print("=" * 60)
+
+    df_model = df.copy()
+
+    # 1. Remove rows without valid target
+    original_rows = len(df_model)
+    df_model = df_model[df_model[target_col].notna()]
+    rows_dropped = original_rows - len(df_model)
+    print(f"\n1. Dropped {rows_dropped:,} rows with missing target")
+    print(f"   Remaining rows: {len(df_model):,}")
+
+    # 2. Remove price outliers (if enabled)
+    if remove_outliers:
+        before_outliers = len(df_model)
+        p_low = df_model[target_col].quantile(outlier_lower_pct)
+        p_high = df_model[target_col].quantile(outlier_upper_pct)
+        df_model = df_model[(df_model[target_col] >= p_low) & (df_model[target_col] <= p_high)]
+        outliers_removed = before_outliers - len(df_model)
+        print(f"\n2. Removed {outliers_removed:,} price outliers ({outlier_lower_pct*100:.0f}th-{outlier_upper_pct*100:.0f}th percentile)")
+        print(f"   Price range kept: €{p_low:,.0f} - €{p_high:,.0f}")
+        print(f"   Remaining rows: {len(df_model):,}")
+
+    # 3. Identify all columns (engineered and original)
+    engineered_cols = [c for c in df_model.columns if c.startswith('_')]
+    original_cols = [c for c in df_model.columns if not c.startswith('_')]
+
+    # Exclude intermediate/parsing columns that shouldn't be in final model
+    exclude_patterns = [
+        # CPU parsing intermediates
+        'cpu_name_clean', 'cpu_normalized_key', 'cpu_parse_status',
+        'cpu_bench_name', 'cpu_bench_mark', 'cpu_bench_rank', 'cpu_bench_value', 'cpu_bench_price_usd',
+        'cpu_model_code', 'cpu_suffix',
+        'cpu_match_score', 'cpu_match_strategy',  # Match metadata
+        # GPU parsing intermediates
+        'gpu_name_clean', 'gpu_normalized_key', 'gpu_parse_status',
+        'gpu_bench_name', 'gpu_bench_mark', 'gpu_bench_rank', 'gpu_bench_value', 'gpu_bench_price_usd',
+        'gpu_model_number', 'gpu_suffix',
+        'gpu_match_score', 'gpu_match_strategy',  # Match metadata
+        # Raw text columns
+        'Título', 'Precio_Rango', 'Serie',
+        # Dataset-specific columns that shouldn't be features
+        'Ofertas', 'Num_ofertas', 'num_ofertas',
+    ]
+
+    original_cols = [c for c in original_cols if c not in exclude_patterns]
+
+    all_candidate_cols = engineered_cols + original_cols
+    print(f"\n3. Found {len(engineered_cols)} engineered features + {len(original_cols)} original columns")
+
+    # 4. Analyze and remove columns with too many missing values
+    print(f"\n4. Filtering columns with >{max_missing_pct*100:.0f}% missing values...")
+
+    missing_analysis = []
+    for col in all_candidate_cols:
+        missing_pct = df_model[col].isna().mean()
+        missing_analysis.append({
+            'column': col,
+            'missing_pct': missing_pct,
+            'keep': missing_pct <= max_missing_pct,
+            'is_engineered': col.startswith('_')
+        })
+
+    missing_df = pd.DataFrame(missing_analysis).sort_values('missing_pct', ascending=False)
+
+    # Show features being removed
+    removed_features = missing_df[~missing_df['keep']]['column'].tolist()
+    kept_features = missing_df[missing_df['keep']]['column'].tolist()
+
+    if removed_features:
+        print(f"\n   Removing {len(removed_features)} columns with >{max_missing_pct*100:.0f}% missing:")
+        for col in removed_features[:15]:  # Show first 15
+            pct = missing_df[missing_df['column'] == col]['missing_pct'].iloc[0]
+            print(f"      - {col}: {pct*100:.1f}% missing")
+        if len(removed_features) > 15:
+            print(f"      ... and {len(removed_features) - 15} more")
+
+    kept_engineered = [c for c in kept_features if c.startswith('_')]
+    kept_original = [c for c in kept_features if not c.startswith('_')]
+    print(f"\n   Keeping {len(kept_engineered)} engineered features + {len(kept_original)} original columns")
+
+    # 5. Select columns for modeling
+    final_cols = kept_features.copy()
+
+    # Remove duplicates while preserving order
+    final_cols = list(dict.fromkeys(final_cols))
+
+    df_final = df_model[final_cols].copy()
+
+    print(f"\n5. Final dataset shape: {df_final.shape}")
+    print(f"   - Rows: {len(df_final):,}")
+    print(f"   - Engineered features: {len(kept_engineered)}")
+    print(f"   - Original columns: {len(kept_original)}")
+    print(f"   - Total columns: {len(df_final.columns)}")
+
+    # 6. Show summary of remaining missing values
+    remaining_missing = df_final[kept_features].isna().mean() * 100
+    remaining_missing = remaining_missing[remaining_missing > 0].sort_values(ascending=False)
+
+    if len(remaining_missing) > 0:
+        print(f"\n6. Remaining missing values (to be imputed by model):")
+        for col, pct in remaining_missing.head(10).items():
+            print(f"      {col}: {pct:.1f}%")
+        if len(remaining_missing) > 10:
+            print(f"      ... and {len(remaining_missing) - 10} more")
+
+    print("\n" + "=" * 60)
+    print("DATA PREPARATION COMPLETE")
+    print("=" * 60)
+
+    return df_final
+
+
+def get_feature_columns(df: pd.DataFrame, target_col: str = '_precio_num') -> Tuple[List[str], List[str], List[str]]:
+    """
+    Get feature columns for modeling, split by numeric and categorical.
+
+    Returns
+    -------
+    Tuple[List[str], List[str], List[str]]
+        - all_features: All feature column names
+        - numeric_features: Numeric feature names
+        - categorical_features: Categorical feature names
+    """
+    # Exclude target column
+    exclude_cols = [target_col]
+
+    # Include both engineered features (_) and original columns
+    all_features = [c for c in df.columns if c not in exclude_cols]
+
+    numeric_features = []
+    categorical_features = []
+
+    for col in all_features:
+        if pd.api.types.is_numeric_dtype(df[col]):
+            numeric_features.append(col)
+        else:
+            categorical_features.append(col)
+
+    return all_features, numeric_features, categorical_features

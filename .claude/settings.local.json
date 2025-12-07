@@ -1,0 +1,33 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls:*)",
+      "Bash(find:*)",
+      "Bash(head:*)",
+      "Bash(wc:*)",
+      "Bash(du -sh:*)",
+      "Bash(python3:*)",
+      "Bash(pip install:*)",
+      "Bash(curl:*)",
+      "Bash(docker-compose logs --tail=30 frontend)",
+      "Bash(docker-compose down:*)",
+      "Bash(docker-compose up:*)",
+      "Bash(docker-compose logs:*)",
+      "Bash(cd:*)",
+      "Bash(docker-compose restart frontend)",
+      "Bash(docker-compose exec frontend sh -c 'wget -qO- http://backend:8000/api/health || echo \"\"FAILED\"\"')",
+      "Bash(docker-compose build:*)",
+      "Bash(cd /Users/jonardinast/Year\\ 5/DAI/assignment_2/computer-price-predictor && docker-compose exec frontend sh -c 'ls -la .env* && cat .env':*)",
+      "Bash(docker-compose exec frontend sh -c 'node -e \"\"console.log(require(\\\"\"vite\\\"\").loadEnv(\\\"\"development\\\"\", \\\"\".\\\"\", \\\"\"\\\"\"))\"\"')",
+      "Bash(cd /Users/jonardinast/Year\\ 5/DAI/assignment_2/computer-price-predictor && docker-compose exec frontend sh -c 'cat vite.config.ts':*)",
+      "Bash(docker-compose exec frontend sh -c 'cat index.html')",
+      "Bash(cd /Users/jonardinast/Year\\ 5/DAI/assignment_2/computer-price-predictor && docker-compose:*)",
+      "Bash(cd /Users/jonardinast/Year\\ 5/DAI/assignment_2/computer-price-predictor && docker-compose exec:*)",
+      "Bash(docker-compose exec frontend sh -c 'echo \"\"VITE_API_TARGET=$VITE_API_TARGET\"\"')",
+      "Bash(docker-compose exec frontend sh -c 'node -e \"\"const apiTarget = process.env.VITE_API_TARGET || \\\"\"http://localhost:8000\\\"\"; console.log(\\\"\"[Test] Proxy target:\\\"\", apiTarget);\"\"')",
+      "Bash(docker-compose exec frontend sh -c 'rm -rf node_modules/.vite && npm run dev -- --host 0.0.0.0 &')"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

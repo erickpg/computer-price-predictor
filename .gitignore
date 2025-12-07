@@ -40,3 +40,7 @@ env/
 dist/
 build/
 *.egg-info/
+
+# Node modules
+frontend/node_modules/
+node_modules/
